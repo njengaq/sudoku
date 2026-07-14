@@ -1,0 +1,4 @@
+- [x] Update `compileSdk` to 37 in `app/build.gradle.kts`
+- [x] Update `targetSdk` to 37 in `app/build.gradle.kts`
+- [x] Verify build with `./gradlew app:assembleDebug`
+- [x] Verify warnings with `analyze_file`
