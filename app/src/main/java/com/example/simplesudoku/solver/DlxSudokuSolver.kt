@@ -231,9 +231,20 @@ class DlxSudokuSolver {
                         boxConstraint(r, c, digit)
                     ).forEach { idx ->
                         val col = columns[idx]
-                        if (col.right !== col || col.left !== col || header.right === col || true) {
-                            // Only cover if not already removed (guards duplicate givens safety)
+
+                        // A column already unlinked from the header row means some earlier
+                        // given already covered it - i.e. two givens are fighting over the
+                        // same constraint (duplicate digit in a row/col/box, or a
+                        // literal duplicate given). That's an invalid puzzle, not a bug -
+                        // bail out cleanly instead of double-covering (which would corrupt
+                        // the matrix's internal linked-list state).
+                        if (col.left.right !== col) {
+                            // Undo whatever we've already pre-covered before returning,
+                            // so this solver instance is still safe to reuse afterward.
+                            for (i in preCovered.indices.reversed()) uncover(preCovered[i])
+                            return null
                         }
+
                         cover(col)
                         preCovered.add(col)
                     }
