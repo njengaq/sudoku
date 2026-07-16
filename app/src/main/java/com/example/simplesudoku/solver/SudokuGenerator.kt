@@ -8,15 +8,17 @@ package com.example.simplesudoku.solver
  *   1. digTarget  - a private tuning knob telling the digger roughly how
  *      many clues to aim for. This is just a shaping instruction, not a
  *      promise, and the digger may land a few clues off it.
- *   2. difficultyLabel - what actually gets shown to the player. Right now
- *      it's *estimated* from clue count (a known-imperfect placeholder -
- *      see design doc §11). Later, once the real Difficulty Rater exists,
- *      that module re-labels the finished puzzle based on which solving
- *      techniques it actually requires - without this Generator needing
- *      to change at all.
+ *   2. difficultyLabel - what actually gets shown to the player. This is
+ *      now the real DifficultyRater's rating (technique-based, 5 values
+ *      including LEGEND for puzzles needing a guess), NOT the clue-count
+ *      target - a Pro-clue-count puzzle can rate as Medium if it happens
+ *      to be easy to crack logically, and vice versa. clueTarget below
+ *      preserves what digHoles originally aimed for, for tuning/telemetry.
  */
+
 class SudokuGenerator(
-    private val uniquenessCounter: DlxUniquenessCounter = DlxUniquenessCounter()
+    private val uniquenessCounter: DlxUniquenessCounter = DlxUniquenessCounter(),
+    private val difficultyRater: DifficultyRater = DifficultyRater()
 ) {
     enum class Difficulty(val minClues: Int, val maxClues: Int) {
         EASY(36, 46),
@@ -29,7 +31,9 @@ class SudokuGenerator(
         val puzzle: Array<IntArray>,
         val solution: Array<IntArray>,
         val clueCount: Int,
-        val difficultyLabel: Difficulty // provisional today; may be re-stamped later by the real rater
+        val clueTarget: Difficulty,           // what digHoles was aiming for (clue-count knob only)
+        val difficultyLabel: DifficultyLabel, // real rating from DifficultyRater - what players see
+        val ratingScore: Int                  // raw weighted score - for progressive-journey ordering later
     )
 
     companion object {
@@ -57,7 +61,10 @@ class SudokuGenerator(
      * throws, never leaves the player with nothing.
      */
     fun generate(target: Difficulty, maxAttempts: Int = 15): GeneratedPuzzle {
-        var best: GeneratedPuzzle? = null
+        // Holds raw attempt data only (puzzle, solution, clueCount) - deliberately
+        // NOT rated yet. Rating (especially any Bifurcation) does real work, so we
+        // only want to pay that cost once, for whichever attempt actually ships.
+        var best: Triple<Array<IntArray>, Array<IntArray>, Int>? = null
         var bestDistance = Int.MAX_VALUE
 
         repeat(maxAttempts) {
@@ -65,30 +72,44 @@ class SudokuGenerator(
             val puzzle = digHoles(solved, target)
             val clueCount = countClues(puzzle)
 
-            val candidate = GeneratedPuzzle(
-                puzzle, solved, clueCount,
-                difficultyLabel = target // provisional label = what we aimed for
-            )
-
             if (clueCount in target.minClues..target.maxClues) {
-                return candidate
+                return buildResult(puzzle, solved, clueCount, target)
             }
 
             val distance = if (clueCount > target.maxClues) clueCount - target.maxClues
             else target.minClues - clueCount
             if (distance < bestDistance) {
                 bestDistance = distance
-                best = candidate
+                best = Triple(puzzle, solved, clueCount)
             }
         }
 
+        val (puzzle, solved, clueCount) = best!!
         println(
             "Note: ${target.name} generation didn't land exactly in " +
                     "[${target.minClues}, ${target.maxClues}] after $maxAttempts attempts " +
-                    "- using closest result (${best!!.clueCount} clues). This is expected " +
+                    "- using closest result ($clueCount clues). This is expected " +
                     "occasionally at low clue counts and is not a bug."
         )
-        return best!!
+        return buildResult(puzzle, solved, clueCount, target)
+    }
+
+    /** Runs the real DifficultyRater exactly once, on the puzzle actually being returned. */
+    private fun buildResult(
+        puzzle: Array<IntArray>,
+        solved: Array<IntArray>,
+        clueCount: Int,
+        target: Difficulty
+    ): GeneratedPuzzle {
+        val rated = difficultyRater.rate(puzzle)
+        return GeneratedPuzzle(
+            puzzle = puzzle,
+            solution = solved,
+            clueCount = clueCount,
+            clueTarget = target,
+            difficultyLabel = rated.label,
+            ratingScore = rated.rawScore
+        )
     }
 
     private fun countClues(grid: Array<IntArray>): Int =
