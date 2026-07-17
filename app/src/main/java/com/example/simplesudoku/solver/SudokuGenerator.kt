@@ -3,37 +3,81 @@ package com.example.simplesudoku.solver
 /**
  * Generates valid, uniquely-solvable Sudoku puzzles.
  *
- * IMPORTANT DESIGN NOTE: "Difficulty" here drives two *separate* things
- * that must not be conflated:
- *   1. digTarget  - a private tuning knob telling the digger roughly how
- *      many clues to aim for. This is just a shaping instruction, not a
- *      promise, and the digger may land a few clues off it.
- *   2. difficultyLabel - what actually gets shown to the player. This is
- *      now the real DifficultyRater's rating (technique-based, 5 values
- *      including LEGEND for puzzles needing a guess), NOT the clue-count
- *      target - a Pro-clue-count puzzle can rate as Medium if it happens
- *      to be easy to crack logically, and vice versa. clueTarget below
- *      preserves what digHoles originally aimed for, for tuning/telemetry.
+ * REVISED AGAIN (see chat history): digHoles no longer just rates at
+ * checkpoints and accepts whatever it finds. Instead, every single
+ * candidate removal is gated by TWO checks (three for EASY), each working
+ * exactly like the existing uniqueness check already did - "does this
+ * specific removal break something? If so, put the clue back and try a
+ * different cell":
+ *
+ *   1. Uniqueness (unchanged) - does the puzzle still have exactly one
+ *      solution?
+ *   2. No forced guess - does the puzzle still fully solve WITHOUT
+ *      Bifurcation? If a removal would force a guess, it's rejected, same
+ *      as a uniqueness failure. This means LEGEND is now essentially
+ *      unreachable from EASY/MEDIUM/HARD/PRO generation - which matches
+ *      targetLabel below (LEGEND was never a target), but is worth
+ *      remembering: if Legend-tier puzzles are ever wanted as real,
+ *      player-facing content, that needs its own separate digging mode
+ *      that deliberately allows what this one avoids.
+ *   3. EASY-only: does this removal keep the puzzle AT EASY, not push it
+ *      past it? EASY is the lowest possible label, so "reached target"
+ *      can't mean "at least this hard" the way it does for the other
+ *      three - it means "stay this easy, but dig as deep as clueFloor
+ *      allows." Same rejection pattern as gate 2, just with EASY's own
+ *      label as the ceiling instead of Bifurcation.
+ *
+ * This also fixes a real bug from the checkpoint version: comparing
+ * "current label >= EASY" is trivially true on the very first checkpoint,
+ * since EASY is the minimum possible ordinal - which is why every EASY
+ * puzzle previously stopped after one checkpoint interval (4 clues) no
+ * matter what. Excluding EASY from that check (gate 3 replaces it) fixes
+ * this.
+ *
+ * Performance note: gate 2's rating call (DifficultyRater.rateWithoutBifurcation)
+ * never touches DlxSudokuSolver - Bifurcation is the only tier that does -
+ * so checking on every single candidate removal is cheap. The previous
+ * checkpoint version actually did MORE expensive work per rating call
+ * (full rate(), including repeated DLX solves whenever Bifurcation fired),
+ * just less often.
  */
-
 class SudokuGenerator(
     private val uniquenessCounter: DlxUniquenessCounter = DlxUniquenessCounter(),
     private val difficultyRater: DifficultyRater = DifficultyRater()
 ) {
-    enum class Difficulty(val minClues: Int, val maxClues: Int) {
-        EASY(36, 46),
-        MEDIUM(32, 35),
-        HARD(28, 31),
-        PRO(22, 27)
+    /**
+     * clueFloor: hard stop on digging regardless of whether targetLabel
+     * has been reached - a per-label floor purely for player-facing
+     * "don't look absurdly sparse" reasons (EASY/MEDIUM keep generous
+     * floors; HARD/PRO get real room to dig).
+     *
+     * targetLabel: the DifficultyRater tier digging aims for. LEGEND is
+     * deliberately not a value here - see the class doc above.
+     */
+    enum class Difficulty(val clueFloor: Int, val targetLabel: DifficultyLabel) {
+        EASY(36, DifficultyLabel.EASY),
+        MEDIUM(32, DifficultyLabel.MEDIUM),
+        HARD(28, DifficultyLabel.HARD),
+        PRO(22, DifficultyLabel.PRO)
     }
 
     data class GeneratedPuzzle(
         val puzzle: Array<IntArray>,
         val solution: Array<IntArray>,
         val clueCount: Int,
-        val clueTarget: Difficulty,           // what digHoles was aiming for (clue-count knob only)
-        val difficultyLabel: DifficultyLabel, // real rating from DifficultyRater - what players see
-        val ratingScore: Int                  // raw weighted score - for progressive-journey ordering later
+        val clueTarget: Difficulty,
+        val difficultyLabel: DifficultyLabel,
+        val floorTier: TechniqueTier,
+        val tierUsageCounts: Map<TechniqueTier, Int>,
+        val ratingScore: Int,
+        val usedBifurcation: Boolean // always false now, kept for API stability / future Legend mode
+    )
+
+    /** Bundles a dig attempt's result with the rating that produced it - avoids re-rating. */
+    private data class DigOutcome(
+        val puzzle: Array<IntArray>,
+        val clueCount: Int,
+        val rating: RaterResult
     )
 
     companion object {
@@ -51,71 +95,73 @@ class SudokuGenerator(
             intArrayOf(2,8,7, 4,1,9, 6,3,5),
             intArrayOf(3,4,5, 2,8,6, 1,7,9)
         )
+
+        init {
+            check(Difficulty.values().all { it.clueFloor >= ABSOLUTE_MIN_CLUES }) {
+                "Every Difficulty.clueFloor must be >= ABSOLUTE_MIN_CLUES ($ABSOLUTE_MIN_CLUES)."
+            }
+        }
     }
 
     /**
-     * Generates a puzzle targeting the given difficulty's clue range.
-     * Retries with a fresh shuffle if a single attempt misses the range,
-     * since not every random arrangement digs down to the same clue count.
-     * If every attempt misses, returns the closest attempt found - never
-     * throws, never leaves the player with nothing.
+     * Generates a puzzle whose DifficultyRater label matches (or exceeds,
+     * for non-EASY targets) [target]'s targetLabel tier, never needing a
+     * guess to solve. Retries with a fresh shuffle if an attempt gets
+     * stuck below target before its clueFloor - not every arrangement
+     * digs down to the same technique requirement.
+     *
+     * If every attempt falls short, ships the closest attempt found
+     * (smallest gap to the target label) - never throws.
      */
-    fun generate(target: Difficulty, maxAttempts: Int = 15): GeneratedPuzzle {
-        // Holds raw attempt data only (puzzle, solution, clueCount) - deliberately
-        // NOT rated yet. Rating (especially any Bifurcation) does real work, so we
-        // only want to pay that cost once, for whichever attempt actually ships.
-        var best: Triple<Array<IntArray>, Array<IntArray>, Int>? = null
-        var bestDistance = Int.MAX_VALUE
+    fun generate(target: Difficulty, maxAttempts: Int = 8): GeneratedPuzzle {
+        var best: Pair<Array<IntArray>, DigOutcome>? = null
+        var bestGap = Int.MAX_VALUE
 
         repeat(maxAttempts) {
             val solved = randomizeGrid(seedGrid)
-            val puzzle = digHoles(solved, target)
-            val clueCount = countClues(puzzle)
+            val outcome = digHoles(solved, target)
 
-            if (clueCount in target.minClues..target.maxClues) {
-                return buildResult(puzzle, solved, clueCount, target)
+            if (outcome.rating.label.ordinal >= target.targetLabel.ordinal) {
+                return buildResult(solved, outcome, target)
             }
 
-            val distance = if (clueCount > target.maxClues) clueCount - target.maxClues
-            else target.minClues - clueCount
-            if (distance < bestDistance) {
-                bestDistance = distance
-                best = Triple(puzzle, solved, clueCount)
+            val gap = target.targetLabel.ordinal - outcome.rating.label.ordinal
+            if (gap < bestGap) {
+                bestGap = gap
+                best = solved to outcome
             }
         }
 
-        val (puzzle, solved, clueCount) = best!!
+        val (solved, outcome) = best!!
         println(
-            "Note: ${target.name} generation didn't land exactly in " +
-                    "[${target.minClues}, ${target.maxClues}] after $maxAttempts attempts " +
-                    "- using closest result ($clueCount clues). This is expected " +
-                    "occasionally at low clue counts and is not a bug."
+            "Note: ${target.name} generation didn't reach ${target.targetLabel} after " +
+                    "$maxAttempts attempts - shipping closest result (${outcome.rating.label}, " +
+                    "${outcome.clueCount} clues). Expected occasionally at the hardest tiers, given " +
+                    "our technique catalog is intentionally smaller than a full solver's - not a bug."
         )
-        return buildResult(puzzle, solved, clueCount, target)
+        return buildResult(solved, outcome, target)
     }
 
-    /** Runs the real DifficultyRater exactly once, on the puzzle actually being returned. */
     private fun buildResult(
-        puzzle: Array<IntArray>,
         solved: Array<IntArray>,
-        clueCount: Int,
+        outcome: DigOutcome,
         target: Difficulty
-    ): GeneratedPuzzle {
-        val rated = difficultyRater.rate(puzzle)
-        return GeneratedPuzzle(
-            puzzle = puzzle,
-            solution = solved,
-            clueCount = clueCount,
-            clueTarget = target,
-            difficultyLabel = rated.label,
-            ratingScore = rated.rawScore
-        )
-    }
+    ): GeneratedPuzzle = GeneratedPuzzle(
+        puzzle = outcome.puzzle,
+        solution = solved,
+        clueCount = outcome.clueCount,
+        clueTarget = target,
+        difficultyLabel = outcome.rating.label,
+        floorTier = outcome.rating.floorTier,
+        tierUsageCounts = outcome.rating.tierUsageCounts,
+        ratingScore = outcome.rating.rawScore,
+        usedBifurcation = outcome.rating.usedBifurcation
+    )
 
-    private fun countClues(grid: Array<IntArray>): Int =
-        grid.sumOf { row -> row.count { it != 0 } }
+    private fun snapshot(grid: Array<IntArray>): Array<IntArray> =
+        grid.map { it.copyOf() }.toTypedArray()
 
-    // ---- Phase 1: random valid solved grid via seed transformation ----
+    // ---- Phase 1: random valid solved grid via seed transformation (unchanged) ----
 
     private fun randomizeGrid(seed: Array<IntArray>): Array<IntArray> {
         var grid = seed.map { it.copyOf() }.toTypedArray()
@@ -166,11 +212,30 @@ class SudokuGenerator(
     private fun transpose(grid: Array<IntArray>): Array<IntArray> =
         Array(N) { r -> IntArray(N) { c -> grid[c][r] } }
 
-    // ---- Phase 2: symmetric digging, gated by uniqueness ----
+    // ---- Phase 2: symmetric digging, gated by uniqueness AND difficulty ----
 
-    private fun digHoles(solved: Array<IntArray>, difficulty: Difficulty): Array<IntArray> {
+    /**
+     * Digs symmetric clue pairs from [solved]. Every candidate removal
+     * must pass:
+     *   1. Uniqueness (as before).
+     *   2. rateWithoutBifurcation succeeds (doesn't force a guess).
+     *   3. For EASY only: the resulting label doesn't exceed EASY.
+     * A removal failing any gate is reverted, exactly like a uniqueness
+     * failure - "try a different cell" instead of "give up."
+     *
+     * Stops at whichever comes first: target label reached (non-EASY),
+     * clueFloor reached, or no more removable cells. Always returns a
+     * real, rated DigOutcome - generate() handles a below-target result
+     * via its best-effort fallback.
+     */
+    private fun digHoles(solved: Array<IntArray>, difficulty: Difficulty): DigOutcome {
         val puzzle = solved.map { it.copyOf() }.toTypedArray()
         var cluesRemaining = N * N
+
+        // Base case (no cells removed yet): trivially EASY, floor SINGLES, score 0.
+        var lastGoodPuzzle = snapshot(puzzle)
+        var lastGoodClues = cluesRemaining
+        var lastGoodRating = difficultyRater.rateWithoutBifurcation(puzzle)!!
 
         val cellOrder = (0 until N * N).shuffled()
         val tried = BooleanArray(N * N)
@@ -189,23 +254,57 @@ class SudokuGenerator(
             if (puzzle[r][c] == 0) continue
 
             val removedCount = if (isCenter) 1 else 2
-            if (cluesRemaining - removedCount < ABSOLUTE_MIN_CLUES) continue
-            if (cluesRemaining <= difficulty.maxClues) break
+            if (cluesRemaining - removedCount < difficulty.clueFloor) continue
 
             val backupPrimary = puzzle[r][c]
             val backupMirror = puzzle[mr][mc]
             puzzle[r][c] = 0
             if (!isCenter) puzzle[mr][mc] = 0
 
-            val count = uniquenessCounter.countSolutions(puzzle, cap = 2)
-            if (count == 1) {
-                cluesRemaining -= removedCount
-            } else {
+            // Gate 1: uniqueness.
+            if (uniquenessCounter.countSolutions(puzzle, cap = 2) != 1) {
                 puzzle[r][c] = backupPrimary
                 puzzle[mr][mc] = backupMirror
+                continue
+            }
+
+            // Gate 2: would this removal force a guess? Reject it, same as gate 1.
+            val rating = difficultyRater.rateWithoutBifurcation(puzzle)
+            if (rating == null) {
+                puzzle[r][c] = backupPrimary
+                puzzle[mr][mc] = backupMirror
+                continue
+            }
+
+            // Gate 3 (EASY only): would this removal push the label past EASY?
+            if (difficulty == Difficulty.EASY && rating.label.ordinal > difficulty.targetLabel.ordinal) {
+                puzzle[r][c] = backupPrimary
+                puzzle[mr][mc] = backupMirror
+                continue
+            }
+
+            cluesRemaining -= removedCount
+            lastGoodPuzzle = snapshot(puzzle)
+            lastGoodClues = cluesRemaining
+            lastGoodRating = rating
+
+            // Non-EASY targets: stop as soon as we've reached (or passed) the target
+            // tier. EASY is excluded here on purpose - see class doc for why ">=" is
+            // meaningless against the lowest possible label; gate 3 above is what
+            // keeps EASY honest instead, and this loop just keeps digging toward
+            // clueFloor for it.
+            val reachedTarget = difficulty != Difficulty.EASY &&
+                    rating.label.ordinal >= difficulty.targetLabel.ordinal
+            val reachedFloor = cluesRemaining <= difficulty.clueFloor
+
+            if (reachedTarget || reachedFloor) {
+                return DigOutcome(lastGoodPuzzle, lastGoodClues, lastGoodRating)
             }
         }
 
-        return puzzle
+        // Ran out of removable cells before reaching target or floor (every
+        // remaining candidate either broke uniqueness or would have forced a
+        // guess) - ship the last known-good, guess-free state found.
+        return DigOutcome(lastGoodPuzzle, lastGoodClues, lastGoodRating)
     }
 }

@@ -87,14 +87,41 @@ class DifficultyRater(
         TechniqueTier.UNIQUE_RECTANGLE, TechniqueTier.CHAIN -> DifficultyLabel.PRO
         TechniqueTier.BIFURCATION -> DifficultyLabel.LEGEND
     }
-}
 
-/*
- * OPEN QUESTION for next session (flagging, not deciding):
- * SudokuGenerator.GeneratedPuzzle.difficultyLabel is currently typed as
- * SudokuGenerator.Difficulty (4 values, clue-count based). This module's
- * DifficultyLabel has 5 values and is technique-based. Need to decide how
- * Generator gets re-stamped once this Rater runs on its output - e.g.
- * does GeneratedPuzzle's field change type to DifficultyLabel, or does
- * something map between the two?
- */
+    /**
+     * Runs every tier EXCEPT Bifurcation to completion. Returns the
+     * resulting RaterResult if the grid fully solves this way, or null if
+     * it gets stuck needing a guess (i.e. Bifurcation genuinely is
+     * required for this puzzle in its current state).
+     *
+     * This is the cheap half of the engine - no DLX solves happen here,
+     * since Bifurcation is the only tier that calls into DlxSudokuSolver.
+     * SudokuGenerator uses this to ask "would removing this clue force a
+     * guess?" on every candidate removal, without paying Bifurcation's
+     * cost at all during digging.
+     */
+    fun rateWithoutBifurcation(puzzle: Array<IntArray>): RaterResult? {
+        val grid = CandidateGrid.fromGivens(puzzle)
+        val nonBifurcationTechniques = techniques.filter { it.tier != TechniqueTier.BIFURCATION }
+        val usageCounts = linkedMapOf<TechniqueTier, Int>()
+        var floor = TechniqueTier.SINGLES
+
+        while (!grid.isSolved()) {
+            val result = nonBifurcationTechniques.firstNotNullOfOrNull { it.tryApply(grid) } ?: break
+            usageCounts[result.tier] = (usageCounts[result.tier] ?: 0) + 1
+            if (result.tier.ordinal > floor.ordinal) floor = result.tier
+        }
+
+        if (!grid.isSolved()) return null // genuinely needs a guess in this state
+
+        val rawScore = usageCounts.entries.sumOf { (tier, count) -> tier.baseWeight * count }
+        return RaterResult(
+            label = labelFor(floor),
+            rawScore = rawScore,
+            floorTier = floor,
+            tierUsageCounts = usageCounts,
+            usedBifurcation = false,
+            solved = true
+        )
+    }
+}

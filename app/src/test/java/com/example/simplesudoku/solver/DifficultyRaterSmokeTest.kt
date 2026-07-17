@@ -8,14 +8,14 @@ import org.junit.Assert.assertTrue
  * their own focused unit tests eventually) - this is a smoke test: generate
  * a handful of puzzles at every clue-target, rate them, and print a
  * breakdown. The main things to eyeball in the output:
- *   - Do EASY-target puzzles mostly land as EASY/MEDIUM, and PRO-target
- *     ones mostly as PRO/LEGEND? (They won't match 1:1 - clue count and
- *     technique difficulty are related but not identical, by design.)
- *   - Is Bifurcation ("Legend") rare, or is it firing constantly? Constant
- *     firing likely means an earlier technique has a bug and isn't
- *     catching deductions it should.
- *   - Does every puzzle report solved=true? If not, something is wrong -
- *     Bifurcation is designed to always finish the job.
+ *   - Does LEGEND basically never show up? (It should be unreachable now -
+ *     digHoles rejects any removal that would force a guess. If LEGEND
+ *     appears, that's a real bug in the bifurcation-avoidance gate.)
+ *   - Does EASY dig down toward its clueFloor (36), not stop after a
+ *     handful of clues?
+ *   - Do MEDIUM/HARD/PRO show a real spread of labels, not just
+ *     everything landing at EASY?
+ *   - Does every puzzle report solved=true?
  */
 class DifficultyRaterSmokeTest {
 
@@ -25,7 +25,7 @@ class DifficultyRaterSmokeTest {
         val rater = DifficultyRater()
 
         SudokuGenerator.Difficulty.values().forEach { target ->
-            println("\n=== Target: ${target.name} (clue range ${target.minClues}-${target.maxClues}) ===")
+            println("\n=== Target: ${target.name} (targetLabel=${target.targetLabel}, clueFloor=${target.clueFloor}) ===")
             val labelTally = mutableMapOf<DifficultyLabel, Int>()
 
             repeat(SAMPLES_PER_TARGET) { i ->

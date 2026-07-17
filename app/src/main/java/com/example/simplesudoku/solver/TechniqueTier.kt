@@ -10,7 +10,10 @@ package com.example.simplesudoku.solver
  * see real puzzles land in each label.
  */
 enum class TechniqueTier(val displayName: String, val baseWeight: Int) {
-    SINGLES("Singles", 1),
+    // Weight 0 is deliberate: singles count scales with how many cells are empty,
+    // not with how hard the puzzle feels, so it shouldn't move the score used for
+    // journey ordering. Still tracked in tierUsageCounts for debugging either way.
+    SINGLES("Singles", 0),
     LOCKED_CANDIDATES("Locked Candidates", 2),
     SUBSETS("Naked/Hidden Subsets", 3),
     BASIC_FISH("Basic Fish (X-Wing)", 5),

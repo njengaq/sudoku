@@ -6,87 +6,87 @@ import com.example.simplesudoku.solver.TechniqueResult
 import com.example.simplesudoku.solver.TechniqueTier
 
 /**
- * X-Wing: if a digit's remaining candidate cells in two rows are confined
- * to the exact same two columns, the digit must occupy one of the two
- * diagonals of that rectangle - so it can be eliminated from those two
- * columns in every other row. Same logic applies swapped (columns forming
- * the pair, eliminating from rows).
+ * Basic fish family: X-Wing (size 2) and Swordfish (size 3). A digit
+ * confined, across `size` rows, to a total of exactly `size` columns
+ * (each of those rows having between 1 and `size` candidate cells for the
+ * digit) means the digit must occupy exactly one cell per row within
+ * those columns - so it can be eliminated from those columns in every
+ * OTHER row. Same logic mirrored for columns confined to rows.
  *
- * This is the only "fish" pattern in scope per the design doc (§11 lists
- * "basic fish" as one technique, not the full fish family) - no Swordfish
- * or Jellyfish (which would be the size-3 / size-4 generalizations).
+ * Jellyfish (size 4) is intentionally left out - "basic fish" in the
+ * design doc means X-Wing/Swordfish, not the full fish family.
  */
 class BasicFishTechnique : Technique {
     override val tier = TechniqueTier.BASIC_FISH
 
     override fun tryApply(grid: CandidateGrid): TechniqueResult? {
-        rowBased(grid)?.let { return it }
-        colBased(grid)?.let { return it }
+        for (size in 2..3) {
+            rowBased(grid, size)?.let { return it }
+            colBased(grid, size)?.let { return it }
+        }
         return null
     }
 
-    /** Digit confined to the same 2 columns across 2 rows -> eliminate from those columns elsewhere. */
-    private fun rowBased(grid: CandidateGrid): TechniqueResult? {
+    private fun rowBased(grid: CandidateGrid, size: Int): TechniqueResult? {
         val n = CandidateGrid.N
         for (digit in 1..9) {
             val bit = CandidateGrid.bitFor(digit)
-            // Only rows where this digit has exactly 2 candidate cells can form an X-Wing corner.
-            val pairRows = (0 until n).mapNotNull { r ->
-                val cols = (0 until n).filter { c -> grid.values[r][c] == 0 && grid.candidates[r][c] and bit != 0 }
-                if (cols.size == 2) r to cols else null
-            }
+            val rowCols = (0 until n)
+                .map { r -> r to (0 until n).filter { c -> grid.values[r][c] == 0 && grid.candidates[r][c] and bit != 0 } }
+                .filter { it.second.isNotEmpty() && it.second.size <= size }
 
-            for (i in pairRows.indices) {
-                for (j in i + 1 until pairRows.size) {
-                    val (r1, cols1) = pairRows[i]
-                    val (r2, cols2) = pairRows[j]
-                    if (cols1 != cols2) continue
+            for (combo in rowCols.fishCombinations(size)) {
+                val unionCols = combo.flatMap { it.second }.toSortedSet()
+                if (unionCols.size != size) continue
 
-                    val (c1, c2) = cols1
-                    var changed = 0
-                    for (r in 0 until n) {
-                        if (r == r1 || r == r2) continue
-                        if (grid.eliminate(r, c1, digit)) changed++
-                        if (grid.eliminate(r, c2, digit)) changed++
-                    }
-                    if (changed > 0) {
-                        return TechniqueResult(tier, "X-Wing (rows $r1,$r2 / cols $c1,$c2): eliminate digit $digit", changed)
-                    }
+                val rowsInCombo = combo.map { it.first }
+                var changed = 0
+                for (r in 0 until n) {
+                    if (r in rowsInCombo) continue
+                    for (c in unionCols) if (grid.eliminate(r, c, digit)) changed++
+                }
+                if (changed > 0) {
+                    val name = if (size == 2) "X-Wing" else "Swordfish"
+                    return TechniqueResult(tier, "$name (rows $rowsInCombo / cols $unionCols): eliminate digit $digit", changed)
                 }
             }
         }
         return null
     }
 
-    /** Mirror of rowBased: digit confined to the same 2 rows across 2 columns. */
-    private fun colBased(grid: CandidateGrid): TechniqueResult? {
+    private fun colBased(grid: CandidateGrid, size: Int): TechniqueResult? {
         val n = CandidateGrid.N
         for (digit in 1..9) {
             val bit = CandidateGrid.bitFor(digit)
-            val pairCols = (0 until n).mapNotNull { c ->
-                val rows = (0 until n).filter { r -> grid.values[r][c] == 0 && grid.candidates[r][c] and bit != 0 }
-                if (rows.size == 2) c to rows else null
-            }
+            val colRows = (0 until n)
+                .map { c -> c to (0 until n).filter { r -> grid.values[r][c] == 0 && grid.candidates[r][c] and bit != 0 } }
+                .filter { it.second.isNotEmpty() && it.second.size <= size }
 
-            for (i in pairCols.indices) {
-                for (j in i + 1 until pairCols.size) {
-                    val (c1, rows1) = pairCols[i]
-                    val (c2, rows2) = pairCols[j]
-                    if (rows1 != rows2) continue
+            for (combo in colRows.fishCombinations(size)) {
+                val unionRows = combo.flatMap { it.second }.toSortedSet()
+                if (unionRows.size != size) continue
 
-                    val (r1, r2) = rows1
-                    var changed = 0
-                    for (c in 0 until n) {
-                        if (c == c1 || c == c2) continue
-                        if (grid.eliminate(r1, c, digit)) changed++
-                        if (grid.eliminate(r2, c, digit)) changed++
-                    }
-                    if (changed > 0) {
-                        return TechniqueResult(tier, "X-Wing (cols $c1,$c2 / rows $r1,$r2): eliminate digit $digit", changed)
-                    }
+                val colsInCombo = combo.map { it.first }
+                var changed = 0
+                for (c in 0 until n) {
+                    if (c in colsInCombo) continue
+                    for (r in unionRows) if (grid.eliminate(r, c, digit)) changed++
+                }
+                if (changed > 0) {
+                    val name = if (size == 2) "X-Wing" else "Swordfish"
+                    return TechniqueResult(tier, "$name (cols $colsInCombo / rows $unionRows): eliminate digit $digit", changed)
                 }
             }
         }
         return null
     }
+}
+
+/** Small combinatorics helper - at most 9 rows/cols, so a naive approach is fine. */
+private fun <T> List<T>.fishCombinations(k: Int): List<List<T>> {
+    if (k == 0) return listOf(emptyList())
+    if (isEmpty()) return emptyList()
+    val head = this[0]
+    val tail = drop(1)
+    return tail.fishCombinations(k - 1).map { listOf(head) + it } + tail.fishCombinations(k)
 }
