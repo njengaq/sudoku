@@ -16,10 +16,10 @@ package com.example.simplesudoku.solver
  *      Bifurcation? If a removal would force a guess, it's rejected, same
  *      as a uniqueness failure. This means LEGEND is now essentially
  *      unreachable from EASY/MEDIUM/HARD/PRO generation - which matches
- *      targetLabel below (LEGEND was never a target), but is worth
- *      remembering: if Legend-tier puzzles are ever wanted as real,
- *      player-facing content, that needs its own separate digging mode
- *      that deliberately allows what this one avoids.
+ *      targetLabel below (LEGEND was never a target for those four), but
+ *      is worth remembering: LEGEND has its own separate digging mode
+ *      (digHolesLegend, below) that deliberately allows what this one
+ *      avoids, gated behind a clue-count cut line - see that method's doc.
  *   3. EASY-only: does this removal keep the puzzle AT EASY, not push it
  *      past it? EASY is the lowest possible label, so "reached target"
  *      can't mean "at least this hard" the way it does for the other
@@ -49,16 +49,17 @@ class SudokuGenerator(
      * clueFloor: hard stop on digging regardless of whether targetLabel
      * has been reached - a per-label floor purely for player-facing
      * "don't look absurdly sparse" reasons (EASY/MEDIUM keep generous
-     * floors; HARD/PRO get real room to dig).
+     * floors; HARD/PRO get real room to dig; LEGEND gets the most room of
+     * all, since it needs to dig deep enough to plausibly force a guess).
      *
-     * targetLabel: the DifficultyRater tier digging aims for. LEGEND is
-     * deliberately not a value here - see the class doc above.
+     * targetLabel: the DifficultyRater tier digging aims for.
      */
     enum class Difficulty(val clueFloor: Int, val targetLabel: DifficultyLabel) {
         EASY(36, DifficultyLabel.EASY),
         MEDIUM(32, DifficultyLabel.MEDIUM),
         HARD(28, DifficultyLabel.HARD),
-        PRO(22, DifficultyLabel.PRO)
+        PRO(22, DifficultyLabel.PRO),
+        LEGEND(18, DifficultyLabel.LEGEND) // NEW - see digHolesLegend for how this is reached
     }
 
     data class GeneratedPuzzle(
@@ -70,7 +71,7 @@ class SudokuGenerator(
         val floorTier: TechniqueTier,
         val tierUsageCounts: Map<TechniqueTier, Int>,
         val ratingScore: Int,
-        val usedBifurcation: Boolean // always false now, kept for API stability / future Legend mode
+        val usedBifurcation: Boolean // true only for LEGEND puzzles that actually required a guess
     )
 
     /** Bundles a dig attempt's result with the rating that produced it - avoids re-rating. */
@@ -83,6 +84,16 @@ class SudokuGenerator(
     companion object {
         private const val N = 9
         private const val ABSOLUTE_MIN_CLUES = 17
+
+        // NEW - placeholder default, NOT yet tuned against real generated output.
+        // Below this remaining-clue count, digHolesLegend is allowed to accept a
+        // removal that forces a guess (Bifurcation). At or above it, LEGEND digs
+        // exactly like PRO - no guesses allowed. This is what stops a lucky early
+        // guess-requiring removal from shipping as LEGEND at, say, 71 clues: the
+        // puzzle must already be substantially hollowed out before a guess
+        // requirement counts toward the label. Revisit once real LEGEND puzzles
+        // start coming out of digHolesLegend.
+        private const val LEGEND_GUESS_CUTLINE = 24
 
         private val seedGrid = arrayOf(
             intArrayOf(5,3,4, 6,7,8, 9,1,2),
@@ -100,15 +111,21 @@ class SudokuGenerator(
             check(Difficulty.values().all { it.clueFloor >= ABSOLUTE_MIN_CLUES }) {
                 "Every Difficulty.clueFloor must be >= ABSOLUTE_MIN_CLUES ($ABSOLUTE_MIN_CLUES)."
             }
+            check(LEGEND_GUESS_CUTLINE >= Difficulty.LEGEND.clueFloor) {
+                "LEGEND_GUESS_CUTLINE must be >= LEGEND's clueFloor, or the guess-allowed " +
+                        "phase would never have room to run."
+            }
         }
     }
 
     /**
      * Generates a puzzle whose DifficultyRater label matches (or exceeds,
-     * for non-EASY targets) [target]'s targetLabel tier, never needing a
-     * guess to solve. Retries with a fresh shuffle if an attempt gets
-     * stuck below target before its clueFloor - not every arrangement
-     * digs down to the same technique requirement.
+     * for non-EASY targets) [target]'s targetLabel tier. For EASY/MEDIUM/
+     * HARD/PRO this never needs a guess to solve; for LEGEND, a guess is
+     * specifically what's being aimed for (see digHolesLegend). Retries
+     * with a fresh shuffle if an attempt gets stuck below target before
+     * its clueFloor - not every arrangement digs down to the same
+     * technique requirement.
      *
      * If every attempt falls short, ships the closest attempt found
      * (smallest gap to the target label) - never throws.
@@ -119,7 +136,11 @@ class SudokuGenerator(
 
         repeat(maxAttempts) {
             val solved = randomizeGrid(seedGrid)
-            val outcome = digHoles(solved, target)
+            val outcome = if (target == Difficulty.LEGEND) {
+                digHolesLegend(solved)
+            } else {
+                digHoles(solved, target)
+            }
 
             if (outcome.rating.label.ordinal >= target.targetLabel.ordinal) {
                 return buildResult(solved, outcome, target)
@@ -227,6 +248,9 @@ class SudokuGenerator(
      * clueFloor reached, or no more removable cells. Always returns a
      * real, rated DigOutcome - generate() handles a below-target result
      * via its best-effort fallback.
+     *
+     * Used for EASY, MEDIUM, HARD, and PRO. LEGEND uses digHolesLegend
+     * instead - see that method's doc for why.
      */
     private fun digHoles(solved: Array<IntArray>, difficulty: Difficulty): DigOutcome {
         val puzzle = solved.map { it.copyOf() }.toTypedArray()
@@ -305,6 +329,119 @@ class SudokuGenerator(
         // Ran out of removable cells before reaching target or floor (every
         // remaining candidate either broke uniqueness or would have forced a
         // guess) - ship the last known-good, guess-free state found.
+        return DigOutcome(lastGoodPuzzle, lastGoodClues, lastGoodRating)
+    }
+
+    /**
+     * NEW - UNTESTED against real generated output yet. Cut-line value
+     * (LEGEND_GUESS_CUTLINE) is an unvalidated placeholder.
+     *
+     * LEGEND-specific digging, kept entirely separate from digHoles rather
+     * than folded into it, since the gating rule genuinely changes
+     * mid-dig:
+     *
+     *   Phase 1 (cluesRemaining after removal > LEGEND_GUESS_CUTLINE):
+     *     behaves exactly like digHoles for PRO - gate 1 (uniqueness) +
+     *     gate 2 (no forced guess, via rateWithoutBifurcation - cheap,
+     *     never touches DlxSudokuSolver).
+     *
+     *   Phase 2 (cluesRemaining after removal <= LEGEND_GUESS_CUTLINE):
+     *     gate 2 relaxes - a removal that forces a guess is now
+     *     acceptable. Gate 1 (uniqueness) is NEVER relaxed: a guess is
+     *     fine, an ambiguous puzzle never is. This phase calls the FULL
+     *     rate() (Bifurcation-capable, does real DLX solves), so it's
+     *     meaningfully more expensive per removal than phase 1 - expected,
+     *     since it only runs on a small tail of removals near the floor.
+     *
+     * The cut line exists specifically so a removal isn't credited as
+     * "LEGEND-worthy" just because it happened to require a guess very
+     * early (e.g. at 71 clues, before the puzzle is meaningfully dug) -
+     * the guess requirement only counts once the puzzle is already
+     * substantially hollowed out.
+     */
+    private fun digHolesLegend(solved: Array<IntArray>): DigOutcome {
+        val puzzle = solved.map { it.copyOf() }.toTypedArray()
+        var cluesRemaining = N * N
+
+        var lastGoodPuzzle = snapshot(puzzle)
+        var lastGoodClues = cluesRemaining
+        var lastGoodRating = difficultyRater.rateWithoutBifurcation(puzzle)!!
+
+        val cellOrder = (0 until N * N).shuffled()
+        val tried = BooleanArray(N * N)
+
+        for (idx in cellOrder) {
+            if (tried[idx]) continue
+            val r = idx / N
+            val c = idx % N
+            val mr = (N - 1) - r
+            val mc = (N - 1) - c
+            val mirrorIdx = mr * N + mc
+            val isCenter = (r == mr && c == mc)
+
+            tried[idx] = true
+            if (!isCenter) tried[mirrorIdx] = true
+            if (puzzle[r][c] == 0) continue
+
+            val removedCount = if (isCenter) 1 else 2
+            val postRemovalClues = cluesRemaining - removedCount
+            if (postRemovalClues < Difficulty.LEGEND.clueFloor) continue
+
+            val backupPrimary = puzzle[r][c]
+            val backupMirror = puzzle[mr][mc]
+            puzzle[r][c] = 0
+            if (!isCenter) puzzle[mr][mc] = 0
+
+            // Gate 1: uniqueness - never relaxed, guess or no guess.
+            if (uniquenessCounter.countSolutions(puzzle, cap = 2) != 1) {
+                puzzle[r][c] = backupPrimary
+                puzzle[mr][mc] = backupMirror
+                continue
+            }
+
+            val allowGuess = postRemovalClues <= LEGEND_GUESS_CUTLINE
+
+            val rating: RaterResult = if (!allowGuess) {
+                // Phase 1: same rule as PRO - reject anything that would force a guess.
+                difficultyRater.rateWithoutBifurcation(puzzle) ?: run {
+                    puzzle[r][c] = backupPrimary
+                    puzzle[mr][mc] = backupMirror
+                    continue
+                }
+            } else {
+                // Phase 2: guess-requiring removals are now acceptable. Full rate()
+                // is Bifurcation-capable and touches DlxSudokuSolver - real cost per
+                // removal from here down, unlike phase 1's cheap gate-2 checks.
+                val full = difficultyRater.rate(puzzle)
+                if (!full.solved) {
+                    // Safety net only - rate() should always solve a uniquely-solvable
+                    // grid (Bifurcation is designed to always find something with 2+
+                    // unsolved cells). Treat an unsolved result as a rejection.
+                    puzzle[r][c] = backupPrimary
+                    puzzle[mr][mc] = backupMirror
+                    continue
+                }
+                full
+            }
+
+            cluesRemaining -= removedCount
+            lastGoodPuzzle = snapshot(puzzle)
+            lastGoodClues = cluesRemaining
+            lastGoodRating = rating
+
+            val reachedTarget = rating.label.ordinal >= DifficultyLabel.LEGEND.ordinal
+            val reachedFloor = cluesRemaining <= Difficulty.LEGEND.clueFloor
+
+            if (reachedTarget || reachedFloor) {
+                return DigOutcome(lastGoodPuzzle, lastGoodClues, lastGoodRating)
+            }
+        }
+
+        // Ran out of removable cells before reaching LEGEND or the floor (every
+        // remaining candidate either broke uniqueness, or - above the cut line -
+        // would have forced a guess too early to count). Ship the last known-good
+        // state found; generate()'s best-effort fallback handles a below-target
+        // result the same way it does for the other four tiers.
         return DigOutcome(lastGoodPuzzle, lastGoodClues, lastGoodRating)
     }
 }

@@ -21,17 +21,19 @@ class PuzzlePackManager(context: Context) {
     private val generatedSource: PuzzleSource = LiveGeneratedSource(bufferDao)
 
     // EASY / HARD: pure live generation, no fallback needed (generator handles these directly)
-    // MEDIUM: shipped bank, falls back to HARD generation if the 5000-bank runs dry
-    // PRO: shipped bank, falls back to PRO generation again for now
-    //      (TODO: should fall back to LEGEND once a Legend-specific digging mode exists -
-    //      see LiveGeneratedSource's toDifficulty() note)
+    // MEDIUM: shipped bank, falls back to HARD generation once the bank is exhausted
+    //         (ShippedBankSource.next() now returns null for good once every entry has
+    //         been served once - no more wraparound - so this fallback genuinely fires)
+    // PRO: shipped bank, falls back to LEGEND generation once the bank is exhausted
+    //      (was a PRO -> PRO stub; now real, since LiveGeneratedSource/SudokuGenerator
+    //      support LEGEND via digHolesLegend)
     private val mediumSource = CascadingPuzzleSource(
         primary = bankSource, primaryCategory = "MEDIUM",
         fallback = generatedSource, fallbackCategory = "HARD"
     )
     private val proSource = CascadingPuzzleSource(
         primary = bankSource, primaryCategory = "PRO",
-        fallback = generatedSource, fallbackCategory = "PRO"
+        fallback = generatedSource, fallbackCategory = "LEGEND"
     )
 
     private fun sourceFor(category: String): PuzzleSource = when (category) {

@@ -16,12 +16,7 @@ class LiveGeneratedSource(
         "MEDIUM" -> SudokuGenerator.Difficulty.MEDIUM
         "HARD" -> SudokuGenerator.Difficulty.HARD
         "PRO" -> SudokuGenerator.Difficulty.PRO
-        // TODO: "LEGEND" has no generator support yet - SudokuGenerator.Difficulty
-        // deliberately excludes it (see class doc in SudokuGenerator.kt). The
-        // Pro -> Legend cascade fallback we designed can't work until a
-        // Legend-specific digging mode exists. For now, PRO-exhaustion falls
-        // back to PRO again (effectively no fallback) rather than crashing.
-        "LEGEND" -> null
+        "LEGEND" -> SudokuGenerator.Difficulty.LEGEND
         else -> null
     }
 

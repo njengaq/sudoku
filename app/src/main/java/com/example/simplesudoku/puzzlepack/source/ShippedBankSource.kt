@@ -61,6 +61,15 @@ class ShippedBankSource(
         if (entries.isEmpty()) return null
 
         val cursor = cursorFor(category, entries.size)
+
+        // Exhaustion is now a real, permanent state for this install, not a
+        // wraparound. Once every entry has been served once, this category's
+        // bank is done until an app update ships a fresh one - the caller
+        // (CascadingPuzzleSource) falls through to generation from here on.
+        if (cursor.currentIndex >= cursor.totalCount) {
+            return null
+        }
+
         val actualIndex = (cursor.currentIndex + cursor.seedOffset) % entries.size
         val entry = entries[actualIndex]
 
